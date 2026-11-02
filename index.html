@@ -1,0 +1,307 @@
+<!doctype html>
+<!--
+  TOTP code — a static page that shows the current TOTP code of a secret.
+
+  It accepts a base32 secret (RFC 4648 §6; case, spaces and `-` ignored, `=`
+  padding allowed), a whole `otpauth://totp/…` link, or a base64url secret.
+  The code follows RFC 6238: HMAC-SHA1, 6 digits, a 30-second step from the
+  Unix epoch, computed with the browser's Web Crypto.
+
+  The secret stays in this page's memory only: nothing is stored, and the
+  Content-Security-Policy below allows no network request at all.
+-->
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; form-action 'none'; base-uri 'none'"
+    />
+    <meta name="referrer" content="no-referrer" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>TOTP code</title>
+    <style>
+      :root {
+        color-scheme: light dark;
+        font-family: system-ui, sans-serif;
+      }
+      body {
+        margin: 0;
+        display: flex;
+        justify-content: center;
+        padding: 48px 16px;
+      }
+      main {
+        width: 100%;
+        max-width: 480px;
+      }
+      h1 {
+        font-size: 1.25rem;
+        margin: 0 0 4px;
+      }
+      p.note {
+        margin: 0 0 24px;
+        opacity: 0.7;
+        font-size: 0.875rem;
+      }
+      label {
+        display: block;
+        font-weight: 600;
+        margin-bottom: 6px;
+      }
+      input,
+      select {
+        width: 100%;
+        box-sizing: border-box;
+        font: inherit;
+        padding: 8px 10px;
+        border-radius: 6px;
+        border: 1px solid #8888;
+        margin-bottom: 16px;
+      }
+      input {
+        font-family: ui-monospace, monospace;
+      }
+      .result {
+        border: 1px solid #8884;
+        border-radius: 8px;
+        padding: 16px;
+      }
+      .code {
+        font-family: ui-monospace, monospace;
+        font-size: 2.5rem;
+        letter-spacing: 0.15em;
+        cursor: pointer;
+        background: none;
+        border: none;
+        padding: 0;
+        color: inherit;
+      }
+      .meta {
+        font-size: 0.875rem;
+        opacity: 0.8;
+        margin-top: 8px;
+      }
+      progress {
+        width: 100%;
+        margin-top: 8px;
+      }
+      .error {
+        color: #c62828;
+      }
+      .check {
+        font-weight: normal;
+        margin-bottom: 16px;
+      }
+      .check input {
+        width: auto;
+        margin: 0 6px 0 0;
+      }
+      .hidden {
+        display: none;
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>TOTP code</h1>
+      <p class="note">
+        HMAC-SHA1, 6 digits, 30 s (RFC 6238). The secret stays in this page and is never sent
+        or stored.
+      </p>
+
+      <label for="secret">TOTP secret or otpauth:// link</label>
+      <input
+        id="secret"
+        type="password"
+        autocomplete="off"
+        spellcheck="false"
+        placeholder="Paste the secret"
+      />
+
+      <label for="format">Secret format</label>
+      <select id="format">
+        <option value="auto">Base32 or otpauth:// link</option>
+        <option value="base64url">Base64url</option>
+      </select>
+
+      <label class="check">
+        <input id="show" type="checkbox" />
+        Show the secret
+      </label>
+
+      <div id="result" class="result hidden" aria-live="polite">
+        <button id="code" class="code" type="button" title="Copy the code"></button>
+        <div class="meta">
+          Valid for <span id="remaining"></span> s · next code <span id="next"></span>
+          <span id="copied" class="hidden"> · copied</span>
+        </div>
+        <progress id="progress" max="30"></progress>
+      </div>
+      <p id="error" class="error hidden" role="alert"></p>
+    </main>
+
+    <script>
+      'use strict';
+
+      const DIGITS = 6;
+      const PERIOD_SECONDS = 30;
+      const ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
+
+      const els = {
+        secret: document.getElementById('secret'),
+        format: document.getElementById('format'),
+        show: document.getElementById('show'),
+        result: document.getElementById('result'),
+        code: document.getElementById('code'),
+        remaining: document.getElementById('remaining'),
+        next: document.getElementById('next'),
+        progress: document.getElementById('progress'),
+        copied: document.getElementById('copied'),
+        error: document.getElementById('error'),
+      };
+
+      /** Bytes of padded or unpadded base32 text, or null when the text is not base32. */
+      function base32Decode(text) {
+        const clean = text.replace(/[\s-]/g, '').toUpperCase().replace(/=+$/, '');
+        if (clean === '') return null;
+        const bytes = [];
+        let buffer = 0;
+        let bits = 0;
+        for (const character of clean) {
+          const value = ALPHABET.indexOf(character);
+          if (value < 0) return null;
+          buffer = (buffer << 5) | value;
+          bits += 5;
+          if (bits >= 8) {
+            bytes.push((buffer >>> (bits - 8)) & 0xff);
+            bits -= 8;
+          }
+          buffer &= (1 << bits) - 1;
+        }
+        return new Uint8Array(bytes);
+      }
+
+      /** Bytes of base64url text, or null when the text is not base64url. */
+      function base64urlDecode(text) {
+        const clean = text.trim().replace(/=+$/, '');
+        if (!/^[A-Za-z0-9_-]+$/.test(clean)) return null;
+        const base64 = clean.replace(/-/g, '+').replace(/_/g, '/');
+        try {
+          const binary = atob(base64 + '='.repeat((4 - (base64.length % 4)) % 4));
+          return Uint8Array.from(binary, (c) => c.charCodeAt(0));
+        } catch {
+          return null;
+        }
+      }
+
+      /** The secret bytes of the input, or a fault text. */
+      function secretFromInput(input, format) {
+        const trimmed = input.trim();
+        if (trimmed === '') return { fault: null };
+        if (trimmed.toLowerCase().startsWith('otpauth://')) {
+          let url;
+          try {
+            url = new URL(trimmed);
+          } catch {
+            return { fault: 'The otpauth:// link is not a valid URL.' };
+          }
+          const secret = url.searchParams.get('secret');
+          const bytes = secret === null ? null : base32Decode(secret);
+          return bytes ? { bytes } : { fault: 'The link has no base32 secret parameter.' };
+        }
+        const bytes = format === 'base64url' ? base64urlDecode(trimmed) : base32Decode(trimmed);
+        if (!bytes || bytes.length === 0) {
+          return {
+            fault:
+              format === 'base64url'
+                ? 'The secret is not base64url.'
+                : 'The secret is not base32. For a base64url secret, select Base64url.',
+          };
+        }
+        return { bytes };
+      }
+
+      /** The code of the key at the step (RFC 4226 §5 truncation), zero-padded. */
+      async function codeAtStep(key, step) {
+        const counter = new ArrayBuffer(8);
+        new DataView(counter).setBigUint64(0, BigInt(step));
+        const digest = new Uint8Array(await crypto.subtle.sign('HMAC', key, counter));
+        const offset = digest[digest.length - 1] & 0x0f;
+        const binary = new DataView(digest.buffer).getUint32(offset) & 0x7fffffff;
+        return String(binary % 10 ** DIGITS).padStart(DIGITS, '0');
+      }
+
+      let key = null;
+      let keyGeneration = 0;
+
+      function showError(text) {
+        els.error.textContent = text;
+        els.error.classList.toggle('hidden', !text);
+        if (text) els.result.classList.add('hidden');
+      }
+
+      async function updateKey() {
+        const generation = ++keyGeneration;
+        key = null;
+        els.result.classList.add('hidden');
+        if (!globalThis.crypto || !crypto.subtle) {
+          showError(
+            'This browser gives no Web Crypto here. Open the file in Chrome, Firefox or Safari.',
+          );
+          return;
+        }
+        const parsed = secretFromInput(els.secret.value, els.format.value);
+        if (!parsed.bytes) {
+          showError(parsed.fault || '');
+          return;
+        }
+        const imported = await crypto.subtle.importKey(
+          'raw',
+          parsed.bytes,
+          { name: 'HMAC', hash: 'SHA-1' },
+          false,
+          ['sign'],
+        );
+        if (generation !== keyGeneration) return;
+        key = imported;
+        showError('');
+        await tick();
+      }
+
+      async function tick() {
+        if (!key) return;
+        const current = key;
+        const seconds = Math.floor(Date.now() / 1000);
+        const step = Math.floor(seconds / PERIOD_SECONDS);
+        const remaining = PERIOD_SECONDS - (seconds % PERIOD_SECONDS);
+        const [code, next] = await Promise.all([
+          codeAtStep(current, step),
+          codeAtStep(current, step + 1),
+        ]);
+        if (current !== key) return;
+        els.code.textContent = code;
+        els.next.textContent = next;
+        els.remaining.textContent = String(remaining);
+        els.progress.value = remaining;
+        els.result.classList.remove('hidden');
+      }
+
+      els.secret.addEventListener('input', updateKey);
+      els.format.addEventListener('change', updateKey);
+      els.show.addEventListener('change', () => {
+        els.secret.type = els.show.checked ? 'text' : 'password';
+      });
+      els.code.addEventListener('click', async () => {
+        try {
+          await navigator.clipboard.writeText(els.code.textContent);
+          els.copied.classList.remove('hidden');
+          setTimeout(() => els.copied.classList.add('hidden'), 1500);
+        } catch {
+          // The clipboard can be refused on file://; the code stays visible to copy by hand.
+        }
+      });
+      setInterval(tick, 1000);
+    </script>
+  </body>
+</html>
